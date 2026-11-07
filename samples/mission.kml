@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <name>Mission Planner Waypoints</name>
+    <Placemark>
+      <name>Flight Plan</name>
+      <LineString>
+        <tessellate>1</tessellate>
+        <coordinates>
+          78.123400,17.412300,15
+          78.123900,17.412300,15
+          78.123900,17.412700,15
+          78.123400,17.412700,15
+          78.123400,17.413100,15
+          78.123900,17.413100,15
+          78.123650,17.412000,10
+        </coordinates>
+      </LineString>
+    </Placemark>
+  </Document>
+</kml>

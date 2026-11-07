@@ -1,0 +1,24 @@
+# /etc/systemd/system/autonomy.service
+#
+# Autostart the companion autonomy daemon after mavlink-router is up.
+#   sudo cp autonomy.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now autonomy.service
+#   journalctl -u autonomy -f      # watch logs
+
+[Unit]
+Description=Companion Drone Autonomy FSM
+After=network.target mavlink-router.service
+Wants=mavlink-router.service
+
+[Service]
+Type=simple
+# Adjust the path to wherever you cloned the repo on the Pi:
+WorkingDirectory=/home/pi/companion-drone/onboard_pi/autonomy
+ExecStart=/usr/bin/python3 main.py --conn udpin:127.0.0.1:14552 --takeoff-alt 15
+Restart=on-failure
+RestartSec=3
+User=pi
+
+[Install]
+WantedBy=multi-user.target
