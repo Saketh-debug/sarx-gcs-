@@ -2,7 +2,7 @@
 // compact companion-status readout.
 const FSM_LABEL = {
   BOOT: 'Booting', IDLE: 'Idle', PREARM: 'Pre-arm checks', TAKEOFF: 'Taking off',
-  EXPLORE: 'Flying waypoints', NAV_LAND: 'To landing point', LAND: 'Landing',
+  HOVER: 'Hovering (Guided)', EXPLORE: 'Flying waypoints', NAV_LAND: 'To landing point', LAND: 'Landing',
 }
 
 export default function StatusPanel({ connected, heartbeat, status, ack }) {
@@ -24,7 +24,7 @@ export default function StatusPanel({ connected, heartbeat, status, ack }) {
       {status && status.n > 0 && (
         <div className="stat">
           <span>Progress</span>
-          <b>wp {status.i} / {status.n}</b>
+          <b>{status.s === 'NAV_LAND' ? `Landing (${status.n}/${status.n})` : `wp ${Math.min(status.i + 1, status.n)} / ${status.n}`}</b>
         </div>
       )}
       {status && status.m && <p className="hint">{status.m}</p>}

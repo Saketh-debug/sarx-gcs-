@@ -1,7 +1,7 @@
 import { pathLengthMeters } from '../utils/kml.js'
 
 // Editable waypoint list: per-wp altitude, reorder, delete, set-all altitude.
-export default function WaypointEditor({ waypoints, cruiseAlt, setCruiseAlt, onChange, onClear }) {
+export default function WaypointEditor({ waypoints, position, cruiseAlt, setCruiseAlt, onChange, onClear }) {
   const setAlt = (i, alt) => {
     const next = waypoints.slice()
     next[i] = { ...next[i], alt: Number(alt) }
@@ -17,6 +17,21 @@ export default function WaypointEditor({ waypoints, cruiseAlt, setCruiseAlt, onC
   const del = (i) => onChange(waypoints.filter((_, k) => k !== i))
   const applyAllAlt = () => onChange(waypoints.map((w) => ({ ...w, alt: cruiseAlt })))
 
+  const generateNearDrone = () => {
+    if (!position || !position.lat || !position.lon) return
+    const dLat = 40 / 111320
+    const dLon = 40 / (111320 * Math.cos((position.lat * Math.PI) / 180))
+    const lat = position.lat
+    const lon = position.lon
+    const box = [
+      { lat: Number((lat + dLat).toFixed(7)), lon: Number(lon.toFixed(7)), alt: cruiseAlt },
+      { lat: Number((lat + dLat).toFixed(7)), lon: Number((lon + dLon).toFixed(7)), alt: cruiseAlt },
+      { lat: Number(lat.toFixed(7)), lon: Number((lon + dLon).toFixed(7)), alt: cruiseAlt },
+      { lat: Number(lat.toFixed(7)), lon: Number(lon.toFixed(7)), alt: cruiseAlt },
+    ]
+    onChange(box)
+  }
+
   const dist = pathLengthMeters(waypoints)
 
   return (
@@ -30,6 +45,14 @@ export default function WaypointEditor({ waypoints, cruiseAlt, setCruiseAlt, onC
         <button className="btn small" onClick={applyAllAlt} disabled={!waypoints.length}>
           Apply to all
         </button>
+      </div>
+      <div style={{ marginTop: '8px', display: 'flex', gap: '6px' }}>
+        <button className="btn small primary" onClick={generateNearDrone} disabled={!position}>
+          📍 Pattern at Drone
+        </button>
+        {waypoints.length > 0 && (
+          <button className="btn small ghost" onClick={onClear}>Clear</button>
+        )}
       </div>
       <p className="hint">Path length ≈ {dist.toFixed(0)} m · right-click a pin to delete</p>
 

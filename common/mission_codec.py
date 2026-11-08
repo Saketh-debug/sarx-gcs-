@@ -43,8 +43,10 @@ MSG_STATUS = 0xA2
 MSG_CMD = 0xC0  # operator command (start / abort), data[0] = command id
 
 # command ids carried by MSG_CMD
-CMD_START = 1   # begin the mission (prearm -> takeoff -> fly)
-CMD_ABORT = 2   # stop autonomy; hand back to GUIDED hover / pilot
+CMD_START = 1    # begin the mission (prearm -> takeoff -> fly)
+CMD_ABORT = 2    # stop autonomy; hand back to GUIDED hover / pilot
+CMD_TAKEOFF = 3  # takeoff at current location to specified altitude (data[1:5] = float alt)
+CMD_LAND = 4     # land immediately at current position
 
 # TUNNEL payload is a fixed 128-byte field; we reserve 4 for the chunk header.
 TUNNEL_PAYLOAD_SIZE = 128
@@ -142,9 +144,9 @@ def make_ack(count: int, crc: int, ok: bool = True) -> bytes:
     return payload + b"\x00" * (TUNNEL_PAYLOAD_SIZE - len(payload))
 
 
-def make_cmd(cmd_id: int) -> bytes:
+def make_cmd(cmd_id: int, param: float = 0.0) -> bytes:
     """Build a one-chunk operator-command payload (padded to 128 bytes)."""
-    data = struct.pack("<B", cmd_id & 0xFF)
+    data = struct.pack("<Bf", cmd_id & 0xFF, float(param))
     payload = struct.pack("<BBBB", MSG_CMD, 0, 1, len(data)) + data
     return payload + b"\x00" * (TUNNEL_PAYLOAD_SIZE - len(payload))
 

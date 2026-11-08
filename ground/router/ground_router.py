@@ -57,14 +57,20 @@ class Router:
     # ---- link <-> MP forwarding + UI extraction ----------------------------
     def _pump_link(self) -> None:
         while self._running:
-            msg = self.link.recv_match(blocking=True, timeout=0.5)
+            try:
+                msg = self.link.recv_match(blocking=True, timeout=0.5)
+            except Exception:
+                continue
             if msg is None:
                 continue
             mtype = msg.get_type()
             if mtype == "BAD_DATA":
                 continue
             # forward every valid frame to Mission Planner untouched
-            self.mp.write(msg.get_msgbuf())
+            try:
+                self.mp.write(msg.get_msgbuf())
+            except Exception:
+                pass
 
             if mtype == "GLOBAL_POSITION_INT":
                 now = time.time()
@@ -78,11 +84,12 @@ class Router:
                         "hdg": (msg.hdg / 100.0) if msg.hdg != 65535 else None,
                     })
             elif mtype == "HEARTBEAT":
-                self.ui_outbox.put({
-                    "kind": "heartbeat",
-                    "armed": bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED),
-                    "mode": mavutil.mode_string_v10(msg),
-                })
+                if getattr(msg, "type", None) != mavutil.mavlink.MAV_TYPE_GCS:
+                    self.ui_outbox.put({
+                        "kind": "heartbeat",
+                        "armed": bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED),
+                        "mode": mavutil.mode_string_v10(msg),
+                    })
             elif mtype == "TUNNEL" and msg.payload_type == mc.TUNNEL_PAYLOAD_TYPE:
                 self._handle_tunnel(bytes(msg.payload[:msg.payload_length]))
 
@@ -104,10 +111,16 @@ class Router:
 
     def _pump_mp(self) -> None:
         while self._running:
-            msg = self.mp.recv_match(blocking=True, timeout=0.5)
+            try:
+                msg = self.mp.recv_match(blocking=True, timeout=0.5)
+            except Exception:
+                continue
             if msg is None or msg.get_type() == "BAD_DATA":
                 continue
-            self.link.write(msg.get_msgbuf())  # uplink from MP to the vehicle
+            try:
+                self.link.write(msg.get_msgbuf())  # uplink from MP to the vehicle
+            except Exception:
+                pass
 
     def _pump_mission(self) -> None:
         while self._running:
@@ -118,14 +131,18 @@ class Router:
             if waypoints is not None:
                 self._send_mission(waypoints)
             try:
-                cmd_id = self.command_inbox.get_nowait()
-                self._send_command(cmd_id)
+                item = self.command_inbox.get_nowait()
+                if isinstance(item, tuple):
+                    cmd_id, alt = item
+                else:
+                    cmd_id, alt = item, 0.0
+                self._send_command(cmd_id, alt)
             except queue.Empty:
                 pass
 
-    def _send_command(self, cmd_id: int) -> None:
-        payload = mc.make_cmd(cmd_id)
-        print(f"[router] sending command id={cmd_id}")
+    def _send_command(self, cmd_id: int, alt: float = 0.0) -> None:
+        payload = mc.make_cmd(cmd_id, alt)
+        print(f"[router] sending command id={cmd_id} (param alt={alt:.1f}m)")
         self.link.mav.tunnel_send(0, 0, mc.TUNNEL_PAYLOAD_TYPE, len(payload), list(payload))
 
     def _send_mission(self, wp_dicts: list) -> None:
@@ -133,6 +150,7 @@ class Router:
         blob = mc.pack_mission(wps)
         chunks = mc.chunk_blob(blob)
         print(f"[router] transmitting mission: {len(wps)} wp, {len(chunks)} TUNNEL chunk(s)")
+        print(f"[router] self.link clients: {getattr(self.link, 'clients', None)}")
         for payload in chunks:
             self.link.mav.tunnel_send(
                 0, 0, mc.TUNNEL_PAYLOAD_TYPE, len(payload), list(payload))
@@ -160,10 +178,16 @@ async def ws_handler(websocket, router: Router):
             if msg.get("kind") == "mission" and isinstance(msg.get("waypoints"), list):
                 router.mission_inbox.put(msg["waypoints"])
             elif msg.get("kind") == "command":
-                cmd_map = {"start": mc.CMD_START, "abort": mc.CMD_ABORT}
+                cmd_map = {
+                    "start": mc.CMD_START,
+                    "abort": mc.CMD_ABORT,
+                    "takeoff": mc.CMD_TAKEOFF,
+                    "land": mc.CMD_LAND,
+                }
                 cmd_id = cmd_map.get(msg.get("cmd"))
                 if cmd_id is not None:
-                    router.command_inbox.put(cmd_id)
+                    alt = float(msg.get("alt", 0.0))
+                    router.command_inbox.put((cmd_id, alt))
     except websockets.ConnectionClosed:
         pass
     finally:

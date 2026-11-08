@@ -65,15 +65,19 @@ class MavInterface:
     # ---- lifecycle ---------------------------------------------------------
     def wait_heartbeat(self, timeout: float = 60.0) -> bool:
         print(f"[mav] waiting for heartbeat on {self.conn_str} ...")
-        hb = self.master.wait_heartbeat(timeout=timeout)
-        if hb is None:
-            return False
-        self._target_sys = self.master.target_system
-        self._target_comp = self.master.target_component
-        with self.tlm._lock:
-            self.tlm.connected = True
-        print(f"[mav] heartbeat from system {self._target_sys} component {self._target_comp}")
-        return True
+        start = time.time()
+        while time.time() - start < timeout:
+            hb = self.master.wait_heartbeat(timeout=1.0)
+            if hb is None:
+                continue
+            if getattr(hb, "type", None) != mavutil.mavlink.MAV_TYPE_GCS:
+                self._target_sys = hb.get_srcSystem() or 1
+                self._target_comp = hb.get_srcComponent() or 1
+                with self.tlm._lock:
+                    self.tlm.connected = True
+                print(f"[mav] heartbeat from system {self._target_sys} component {self._target_comp}")
+                return True
+        return False
 
     def start(self) -> None:
         threading.Thread(target=self._pump, daemon=True).start()
@@ -83,23 +87,35 @@ class MavInterface:
 
     def _pump(self) -> None:
         while self._running:
-            msg = self.master.recv_match(blocking=True, timeout=0.5)
+            try:
+                msg = self.master.recv_match(blocking=True, timeout=0.5)
+            except Exception:
+                continue
             if msg is None:
                 continue
             t = msg.get_type()
+
+            # Filter: only accept autopilot vehicle telemetry; never let GCS heartbeats overwrite vehicle state!
+            src_sys = msg.get_srcSystem()
+            src_comp = msg.get_srcComponent()
+            is_vehicle = (src_sys == self._target_sys and
+                          (src_comp == self._target_comp or src_comp == 1) and
+                          getattr(msg, "type", None) != mavutil.mavlink.MAV_TYPE_GCS)
+
             with self.tlm._lock:
-                if t == "HEARTBEAT":
+                if t == "HEARTBEAT" and is_vehicle:
                     self.tlm.armed = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
                     self.tlm.mode = mavutil.mode_string_v10(msg)
                     self.tlm.last_heartbeat = time.time()
-                elif t == "GLOBAL_POSITION_INT":
+                elif t == "GLOBAL_POSITION_INT" and is_vehicle:
                     self.tlm.lat = msg.lat / 1e7
                     self.tlm.lon = msg.lon / 1e7
                     self.tlm.rel_alt = msg.relative_alt / 1000.0
-                elif t == "GPS_RAW_INT":
+                elif t == "GPS_RAW_INT" and is_vehicle:
                     self.tlm.fix_type = msg.fix_type
                     self.tlm.satellites = msg.satellites_visible
                     self.tlm.hdop = msg.eph / 100.0 if msg.eph != 65535 else 99.9
+
             if t == "TUNNEL" and msg.payload_type == mc.TUNNEL_PAYLOAD_TYPE and self._on_tunnel:
                 self._on_tunnel(bytes(msg.payload[:msg.payload_length]))
 
@@ -140,3 +156,7 @@ class MavInterface:
         self.master.mav.command_long_send(
             self._target_sys, self._target_comp,
             mavutil.mavlink.MAV_CMD_NAV_LAND, 0, 0, 0, 0, 0, 0, 0, 0)
+        try:
+            self.set_mode("LAND")
+        except Exception:
+            pass

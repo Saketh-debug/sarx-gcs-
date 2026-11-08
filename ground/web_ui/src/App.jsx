@@ -39,6 +39,7 @@ export default function App() {
         <KmlUploader onLoaded={setWaypoints} cruiseAlt={cruiseAlt} />
         <WaypointEditor
           waypoints={waypoints}
+          position={position}
           cruiseAlt={cruiseAlt}
           setCruiseAlt={setCruiseAlt}
           onChange={setWaypoints}

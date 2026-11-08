@@ -31,6 +31,7 @@ class State(Enum):
     IDLE = auto()
     PREARM = auto()
     TAKEOFF = auto()
+    HOVER = auto()
     EXPLORE = auto()
     NAV_LAND = auto()
     LAND = auto()
@@ -39,11 +40,11 @@ class State(Enum):
 @dataclass
 class FsmConfig:
     takeoff_alt_m: float = 15.0
-    accept_radius_m: float = 1.5
+    accept_radius_m: float = 2.5
     dwell_s: float = 2.0
     land_on_last_wp: bool = True   # treat final waypoint as the landing point
-    min_satellites: int = 10
-    max_hdop: float = 1.2
+    min_satellites: int = 8
+    max_hdop: float = 2.0
     status_hz: float = 2.0
 
 
@@ -58,11 +59,17 @@ class AutonomyFSM:
         self._dwell_until = 0.0
         self._start_requested = False
         self._abort_requested = False
+        self._takeoff_requested = False
+        self._takeoff_alt = cfg.takeoff_alt_m
+        self._land_requested = False
+        self._active_takeoff_alt = cfg.takeoff_alt_m
+        self._next_after_takeoff = State.HOVER
         self._lock = threading.Lock()
         self._last_status = 0.0
+        self._guided_lost_count = 0
 
     # ---- operator commands (called from the MAVLink pump thread) -----------
-    def handle_command(self, cmd_id: int) -> None:
+    def handle_command(self, cmd_id: int, param: float = 0.0) -> None:
         with self._lock:
             if cmd_id == mc.CMD_START:
                 self._start_requested = True
@@ -70,6 +77,13 @@ class AutonomyFSM:
             elif cmd_id == mc.CMD_ABORT:
                 self._abort_requested = True
                 print("[fsm] ABORT requested")
+            elif cmd_id == mc.CMD_TAKEOFF:
+                self._takeoff_requested = True
+                self._takeoff_alt = param if param > 0 else self.cfg.takeoff_alt_m
+                print(f"[fsm] TAKEOFF requested (alt={self._takeoff_alt:.1f}m)")
+            elif cmd_id == mc.CMD_LAND:
+                self._land_requested = True
+                print("[fsm] LAND requested")
 
     def _consume_start(self) -> bool:
         with self._lock:
@@ -79,6 +93,16 @@ class AutonomyFSM:
     def _consume_abort(self) -> bool:
         with self._lock:
             v, self._abort_requested = self._abort_requested, False
+            return v
+
+    def _consume_takeoff(self) -> tuple[bool, float]:
+        with self._lock:
+            v, self._takeoff_requested = self._takeoff_requested, False
+            return v, self._takeoff_alt
+
+    def _consume_land(self) -> bool:
+        with self._lock:
+            v, self._land_requested = self._land_requested, False
             return v
 
     # ---- helpers -----------------------------------------------------------
@@ -98,6 +122,23 @@ class AutonomyFSM:
     def _in_guided(self, tlm: Telemetry) -> bool:
         return tlm.mode.upper() == "GUIDED"
 
+    def _advance_waypoint(self) -> None:
+        old_idx = self.wp_index
+        self.wp_index += 1
+        self._dwell_until = 0.0
+        last_idx = len(self.mission) - 1
+        explore_end = last_idx - 1 if self.cfg.land_on_last_wp else last_idx
+        if self.wp_index <= explore_end:
+            next_wp = self.mission[self.wp_index]
+            print(f"[fsm] WP {old_idx + 1} complete -> commanding WP {self.wp_index + 1}/{len(self.mission)}: lat={next_wp.lat}, lon={next_wp.lon}, alt={next_wp.alt}")
+            self._goto(next_wp)
+        else:
+            print(f"[fsm] Completed all exploration waypoints (0..{explore_end}) -> transitioning to NAV_LAND")
+            self.state = State.NAV_LAND
+            land_wp = self.mission[-1]
+            print(f"[fsm] Commanding landing point: lat={land_wp.lat}, lon={land_wp.lon}, alt={land_wp.alt}")
+            self._goto(land_wp)
+
     # ---- main loop ---------------------------------------------------------
     def run(self) -> None:
         print("[fsm] running")
@@ -114,9 +155,19 @@ class AutonomyFSM:
                     print("[fsm] new mission mid-flight -> returning to IDLE")
                 self.state = State.IDLE
 
-            # global abort: stop autonomy, hold in IDLE (vehicle hovers in GUIDED)
+            # global abort: stop autonomy, hold in HOVER if airborne else IDLE
             if self._consume_abort():
-                self.state = State.IDLE
+                if tlm.armed and tlm.rel_alt >= 2.0:
+                    print("[fsm] abort -> holding in HOVER")
+                    self.state = State.HOVER
+                else:
+                    self.state = State.IDLE
+
+            # global land command
+            if self._consume_land():
+                print("[fsm] LAND command received -> commanding land")
+                self.mav.land()
+                self.state = State.LAND
 
             self._tick(tlm)
             self._emit_status()
@@ -124,77 +175,160 @@ class AutonomyFSM:
 
     def _tick(self, tlm: Telemetry) -> None:
         if self.state == State.IDLE:
-            if self.mission and self._consume_start():
-                self.state = State.PREARM
+            req_takeoff, to_alt = self._consume_takeoff()
+            if req_takeoff:
+                if tlm.armed and tlm.rel_alt >= 2.0:
+                    print("[fsm] TAKEOFF requested while already airborne -> ensuring GUIDED -> HOVER")
+                    if not self._in_guided(tlm):
+                        self.mav.set_mode("GUIDED")
+                    self.state = State.HOVER
+                else:
+                    self._active_takeoff_alt = to_alt
+                    self._next_after_takeoff = State.HOVER
+                    self.state = State.PREARM
+            elif self.mission and self._consume_start():
+                if tlm.armed and tlm.rel_alt >= 2.0:
+                    print("[fsm] START requested while already airborne -> ensuring GUIDED -> EXPLORE")
+                    if not self._in_guided(tlm):
+                        self.mav.set_mode("GUIDED")
+                    self.wp_index = 0
+                    self._dwell_until = 0.0
+                    self._goto(self.mission[0])
+                    self.state = State.EXPLORE
+                else:
+                    self._active_takeoff_alt = self.cfg.takeoff_alt_m
+                    self._next_after_takeoff = State.EXPLORE
+                    self.state = State.PREARM
 
         elif self.state == State.PREARM:
             if tlm.fix_type < 3 or tlm.satellites < self.cfg.min_satellites \
                     or tlm.hdop > self.cfg.max_hdop:
                 self._emit_status(f"prearm wait fix={tlm.fix_type} sat={tlm.satellites}")
                 return
-            print("[fsm] prearm OK -> GUIDED + arm + takeoff")
+            target_alt = getattr(self, "_active_takeoff_alt", self.cfg.takeoff_alt_m)
+            print(f"[fsm] prearm OK -> GUIDED + arm + takeoff ({target_alt:.1f}m)")
             self.mav.set_mode("GUIDED")
             time.sleep(0.5)
             self.mav.arm()
             time.sleep(1.0)
-            self.mav.takeoff(self.cfg.takeoff_alt_m)
+            self.mav.takeoff(target_alt)
             self.state = State.TAKEOFF
 
         elif self.state == State.TAKEOFF:
             if not self._in_guided(tlm):
-                print("[fsm] left GUIDED during takeoff -> IDLE")
-                self.state = State.IDLE
-                return
-            if tlm.rel_alt >= 0.95 * self.cfg.takeoff_alt_m:
-                print(f"[fsm] reached takeoff alt {tlm.rel_alt:.1f} m -> EXPLORE")
+                self._guided_lost_count += 1
+                if self._guided_lost_count >= 8:
+                    print(f"[fsm] left GUIDED during takeoff (mode={tlm.mode}) -> IDLE")
+                    self.state = State.IDLE
+                    self._guided_lost_count = 0
+                    return
+            else:
+                self._guided_lost_count = 0
+
+            target_alt = getattr(self, "_active_takeoff_alt", self.cfg.takeoff_alt_m)
+            if tlm.rel_alt >= 0.95 * target_alt:
+                next_state = getattr(self, "_next_after_takeoff", State.HOVER)
+                if next_state == State.EXPLORE and self.mission:
+                    print(f"[fsm] reached takeoff alt {tlm.rel_alt:.1f} m -> EXPLORE ({len(self.mission)} waypoints)")
+                    self.wp_index = 0
+                    self._dwell_until = 0.0
+                    self._goto(self.mission[0])
+                    self.state = State.EXPLORE
+                else:
+                    print(f"[fsm] reached takeoff alt {tlm.rel_alt:.1f} m -> HOVER (awaiting operator)")
+                    self.state = State.HOVER
+
+        elif self.state == State.HOVER:
+            if not self._in_guided(tlm):
+                self._guided_lost_count += 1
+                if self._guided_lost_count >= 8:
+                    print(f"[fsm] left GUIDED during hover (mode={tlm.mode}) -> IDLE")
+                    self.state = State.IDLE
+                    self._guided_lost_count = 0
+                    return
+            else:
+                self._guided_lost_count = 0
+
+            self._emit_status("hovering in GUIDED")
+            if self.mission and self._consume_start():
+                print(f"[fsm] START requested from HOVER -> EXPLORE ({len(self.mission)} waypoints)")
                 self.wp_index = 0
                 self._dwell_until = 0.0
-                if self.mission:
-                    self._goto(self.mission[0])
+                self._goto(self.mission[0])
                 self.state = State.EXPLORE
 
         elif self.state == State.EXPLORE:
             if not self._in_guided(tlm):
-                print("[fsm] left GUIDED -> IDLE")
-                self.state = State.IDLE
-                return
+                self._guided_lost_count += 1
+                if self._guided_lost_count >= 8:
+                    print(f"[fsm] left GUIDED during EXPLORE (mode={tlm.mode}) -> IDLE")
+                    self.state = State.IDLE
+                    self._guided_lost_count = 0
+                    return
+            else:
+                self._guided_lost_count = 0
+
             last_idx = len(self.mission) - 1
             # With land_on_last_wp, EXPLORE covers waypoints 0..last-1 and the
             # final descent happens at the last waypoint in NAV_LAND. Otherwise
             # EXPLORE covers all waypoints and NAV_LAND re-targets the last one.
             explore_end = last_idx - 1 if self.cfg.land_on_last_wp else last_idx
             if self.wp_index > explore_end:
+                print(f"[fsm] Exploration waypoints complete -> transitioning to NAV_LAND")
                 self.state = State.NAV_LAND
+                self._dwell_until = 0.0
+                land_wp = self.mission[-1]
+                print(f"[fsm] Commanding landing point: lat={land_wp.lat}, lon={land_wp.lon}, alt={land_wp.alt}")
+                self._goto(land_wp)
                 return
+
             wp = self.mission[self.wp_index]
             self._goto(wp)
             d = self._dist_to(tlm, wp)
-            self._emit_status(f"wp{self.wp_index} d={d:.1f}m")
+            if d > 2000.0:
+                self._emit_status(f"wp{self.wp_index + 1}/{len(self.mission)} {d/1000:.1f}km away!")
+            else:
+                self._emit_status(f"wp{self.wp_index + 1}/{len(self.mission)} d={d:.1f}m")
+
             if d <= self.cfg.accept_radius_m:
                 if self._dwell_until == 0.0:
-                    self._dwell_until = time.time() + self.cfg.dwell_s
+                    if self.cfg.dwell_s > 0:
+                        self._dwell_until = time.time() + self.cfg.dwell_s
+                        print(f"[fsm] Arrived at WP {self.wp_index + 1}/{len(self.mission)} (d={d:.1f}m) -> dwelling {self.cfg.dwell_s:.1f}s")
+                    else:
+                        self._advance_waypoint()
                 elif time.time() >= self._dwell_until:
                     self._dwell_until = 0.0
-                    self.wp_index += 1
+                    self._advance_waypoint()
             else:
-                self._dwell_until = 0.0
+                # If dwelling, allow hysteresis up to accept_radius * 1.5 so GPS jitter doesn't reset dwell
+                if self._dwell_until > 0.0 and d > self.cfg.accept_radius_m * 1.5:
+                    print(f"[fsm] Drifted from WP {self.wp_index + 1} (d={d:.1f}m) -> resetting dwell")
+                    self._dwell_until = 0.0
 
         elif self.state == State.NAV_LAND:
             if not self._in_guided(tlm):
-                self.state = State.IDLE
-                return
+                self._guided_lost_count += 1
+                if self._guided_lost_count >= 8:
+                    print(f"[fsm] left GUIDED during NAV_LAND (mode={tlm.mode}) -> IDLE")
+                    self.state = State.IDLE
+                    self._guided_lost_count = 0
+                    return
+            else:
+                self._guided_lost_count = 0
+
             land_wp = self.mission[-1]
             self._goto(land_wp)
             d = self._dist_to(tlm, land_wp)
             self._emit_status(f"to-land d={d:.1f}m")
             if d <= self.cfg.accept_radius_m:
-                print("[fsm] arrived at landing point -> LAND")
+                print(f"[fsm] Arrived at landing point (d={d:.1f}m) -> commanding LAND")
                 self.mav.land()
                 self.state = State.LAND
 
         elif self.state == State.LAND:
             self._emit_status("landing")
             if not tlm.armed:  # ArduPilot auto-disarms on touchdown
-                print("[fsm] disarmed after touchdown -> IDLE")
+                print("[fsm] Disarmed after touchdown -> mission completed successfully, returning to IDLE")
                 self.wp_index = 0
                 self.state = State.IDLE

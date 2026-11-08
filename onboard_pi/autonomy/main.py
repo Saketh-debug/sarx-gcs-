@@ -29,7 +29,8 @@ def parse_args():
     p.add_argument("--conn", default="udpin:127.0.0.1:14552",
                    help="pymavlink connection to mavlink-router (or SITL)")
     p.add_argument("--takeoff-alt", type=float, default=15.0)
-    p.add_argument("--accept-radius", type=float, default=1.5)
+    p.add_argument("--accept-radius", type=float, default=2.5,
+                   help="acceptance radius in meters for waypoints (default 2.5m)")
     p.add_argument("--dwell", type=float, default=2.0)
     p.add_argument("--no-land-on-last", action="store_true",
                    help="do not treat the final waypoint as the landing point")
@@ -51,12 +52,21 @@ def main():
 
     def on_tunnel(payload: bytes) -> None:
         frame = mc.parse_frame(payload)
+        print(f"[main] TUNNEL received: {len(payload)} bytes, frame={frame}")
         if frame is None:
             return
         if frame["type"] == mc.MSG_MISSION:
             rx_holder["rx"].on_tunnel(payload)
         elif frame["type"] == mc.MSG_CMD and frame["data"]:
-            fsm_holder["fsm"].handle_command(frame["data"][0])
+            cmd_id = frame["data"][0]
+            alt = 0.0
+            if len(frame["data"]) >= 5:
+                import struct
+                try:
+                    alt = struct.unpack("<f", frame["data"][1:5])[0]
+                except Exception:
+                    alt = 0.0
+            fsm_holder["fsm"].handle_command(cmd_id, alt)
 
     mav = MavInterface(args.conn, on_tunnel=on_tunnel)
     rx = MissionReceiver(mav)
