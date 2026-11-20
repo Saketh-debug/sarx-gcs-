@@ -52,10 +52,20 @@ class Router:
         self.mission_inbox: "queue.Queue[list]" = queue.Queue()  # waypoints <- web UI
         self.command_inbox: "queue.Queue[int]" = queue.Queue()   # cmd id <- web UI
         self._last_pos_push = 0.0
+        self._last_gps_push = 0.0
+        self._last_sys_push = 0.0
+        self._last_att_push = 0.0
+        self._last_stats_push = 0.0
+        self._last_hb_time = 0.0
+        self._packet_count = 0
+        self._last_packet_count = 0
+        self._last_stats_time = time.time()
         self._running = True
 
     # ---- link <-> MP forwarding + UI extraction ----------------------------
     def _pump_link(self) -> None:
+        import math
+        import struct
         while self._running:
             try:
                 msg = self.link.recv_match(blocking=True, timeout=0.5)
@@ -66,14 +76,16 @@ class Router:
             mtype = msg.get_type()
             if mtype == "BAD_DATA":
                 continue
+
+            self._packet_count += 1
             # forward every valid frame to Mission Planner untouched
             try:
                 self.mp.write(msg.get_msgbuf())
             except Exception:
                 pass
 
+            now = time.time()
             if mtype == "GLOBAL_POSITION_INT":
-                now = time.time()
                 if now - self._last_pos_push >= 0.25:  # ~4 Hz to the browser
                     self._last_pos_push = now
                     self.ui_outbox.put({
@@ -85,13 +97,69 @@ class Router:
                     })
             elif mtype == "HEARTBEAT":
                 if getattr(msg, "type", None) != mavutil.mavlink.MAV_TYPE_GCS:
+                    self._last_hb_time = now
                     self.ui_outbox.put({
                         "kind": "heartbeat",
                         "armed": bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED),
                         "mode": mavutil.mode_string_v10(msg),
+                        "sys_id": msg.get_srcSystem(),
+                        "comp_id": msg.get_srcComponent(),
                     })
+            elif mtype == "GPS_RAW_INT":
+                if now - self._last_gps_push >= 0.5:  # 2 Hz
+                    self._last_gps_push = now
+                    self.ui_outbox.put({
+                        "kind": "gps",
+                        "fix_type": msg.fix_type,
+                        "satellites": msg.satellites_visible,
+                        "hdop": (msg.eph / 100.0) if msg.eph != 65535 else 99.9,
+                    })
+            elif mtype == "SYS_STATUS":
+                if now - self._last_sys_push >= 0.5:  # 2 Hz
+                    self._last_sys_push = now
+                    self.ui_outbox.put({
+                        "kind": "sys_status",
+                        "voltage": round(msg.voltage_battery / 1000.0, 2),
+                        "current": round(msg.current_battery / 100.0, 2) if msg.current_battery != -1 else None,
+                        "battery_remaining": msg.battery_remaining if msg.battery_remaining != -1 else None,
+                    })
+            elif mtype == "ATTITUDE":
+                if now - self._last_att_push >= 0.2:  # 5 Hz
+                    self._last_att_push = now
+                    self.ui_outbox.put({
+                        "kind": "attitude",
+                        "roll": round(math.degrees(msg.roll), 1),
+                        "pitch": round(math.degrees(msg.pitch), 1),
+                        "yaw": round(math.degrees(msg.yaw), 1),
+                    })
+            elif mtype == "RADIO_STATUS":
+                self.ui_outbox.put({
+                    "kind": "radio",
+                    "rssi": msg.rssi,
+                    "remrssi": msg.remrssi,
+                    "rxerrors": msg.rxerrors,
+                    "fixed": msg.fixed,
+                    "noise": getattr(msg, "noise", 0),
+                    "remnoise": getattr(msg, "remnoise", 0),
+                })
             elif mtype == "TUNNEL" and msg.payload_type == mc.TUNNEL_PAYLOAD_TYPE:
                 self._handle_tunnel(bytes(msg.payload[:msg.payload_length]))
+
+            # Periodic link statistics push (1 Hz)
+            if now - self._last_stats_push >= 1.0:
+                dt = now - self._last_stats_time
+                pkts = self._packet_count - self._last_packet_count
+                rate_hz = round(pkts / dt, 1) if dt > 0 else 0.0
+                self._last_stats_push = now
+                self._last_stats_time = now
+                self._last_packet_count = self._packet_count
+                hb_age = round(now - self._last_hb_time, 1) if self._last_hb_time > 0 else None
+                self.ui_outbox.put({
+                    "kind": "link_stats",
+                    "rate_hz": rate_hz,
+                    "total_packets": self._packet_count,
+                    "hb_age": hb_age,
+                })
 
     def _handle_tunnel(self, payload: bytes) -> None:
         frame = mc.parse_frame(payload)
@@ -106,6 +174,14 @@ class Router:
             # STATUS data = UTF-8 JSON produced by the Pi's status_tx
             try:
                 self.ui_outbox.put({"kind": "status", **json.loads(frame["data"].decode("utf-8"))})
+            except Exception:
+                pass
+        elif frame["type"] == mc.MSG_PONG:
+            try:
+                import struct
+                sent_t = struct.unpack("<d", frame["data"][:8])[0]
+                rtt = (time.time() - sent_t) * 1000.0
+                self.ui_outbox.put({"kind": "pong", "rtt_ms": round(rtt, 1), "t": sent_t})
             except Exception:
                 pass
 
@@ -177,6 +253,8 @@ async def ws_handler(websocket, router: Router):
                 continue
             if msg.get("kind") == "mission" and isinstance(msg.get("waypoints"), list):
                 router.mission_inbox.put(msg["waypoints"])
+            elif msg.get("kind") == "ping":
+                router.command_inbox.put((mc.CMD_PING, time.time()))
             elif msg.get("kind") == "command":
                 cmd_map = {
                     "start": mc.CMD_START,

@@ -41,12 +41,14 @@ MSG_ACK = 0x06
 MSG_NACK = 0x15
 MSG_STATUS = 0xA2
 MSG_CMD = 0xC0  # operator command (start / abort), data[0] = command id
+MSG_PONG = 0x07 # latency ping response, data = double timestamp
 
 # command ids carried by MSG_CMD
 CMD_START = 1    # begin the mission (prearm -> takeoff -> fly)
 CMD_ABORT = 2    # stop autonomy; hand back to GUIDED hover / pilot
 CMD_TAKEOFF = 3  # takeoff at current location to specified altitude (data[1:5] = float alt)
 CMD_LAND = 4     # land immediately at current position
+CMD_PING = 5     # link latency ping test (data[1:9] = double timestamp)
 
 # TUNNEL payload is a fixed 128-byte field; we reserve 4 for the chunk header.
 TUNNEL_PAYLOAD_SIZE = 128
@@ -146,8 +148,19 @@ def make_ack(count: int, crc: int, ok: bool = True) -> bytes:
 
 def make_cmd(cmd_id: int, param: float = 0.0) -> bytes:
     """Build a one-chunk operator-command payload (padded to 128 bytes)."""
-    data = struct.pack("<Bf", cmd_id & 0xFF, float(param))
+    # Use double precision for timestamp if CMD_PING, else float
+    if cmd_id == CMD_PING:
+        data = struct.pack("<Bd", cmd_id & 0xFF, float(param))
+    else:
+        data = struct.pack("<Bf", cmd_id & 0xFF, float(param))
     payload = struct.pack("<BBBB", MSG_CMD, 0, 1, len(data)) + data
+    return payload + b"\x00" * (TUNNEL_PAYLOAD_SIZE - len(payload))
+
+
+def make_pong(timestamp: float) -> bytes:
+    """Build a one-chunk latency pong payload (padded to 128 bytes)."""
+    data = struct.pack("<d", float(timestamp))
+    payload = struct.pack("<BBBB", MSG_PONG, 0, 1, len(data)) + data
     return payload + b"\x00" * (TUNNEL_PAYLOAD_SIZE - len(payload))
 
 
@@ -156,7 +169,7 @@ def parse_frame(payload: bytes) -> Optional[dict]:
     if len(payload) < CHUNK_HEADER_SIZE:
         return None
     ftype, seq, total, data_len = struct.unpack("<BBBB", payload[:CHUNK_HEADER_SIZE])
-    if ftype not in (MSG_MISSION, MSG_ACK, MSG_NACK, MSG_STATUS, MSG_CMD):
+    if ftype not in (MSG_MISSION, MSG_ACK, MSG_NACK, MSG_STATUS, MSG_CMD, MSG_PONG):
         return None
     if data_len > MAX_CHUNK_DATA:
         return None

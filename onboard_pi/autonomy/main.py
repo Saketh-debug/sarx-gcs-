@@ -59,6 +59,17 @@ def main():
             rx_holder["rx"].on_tunnel(payload)
         elif frame["type"] == mc.MSG_CMD and frame["data"]:
             cmd_id = frame["data"][0]
+            if cmd_id == mc.CMD_PING:
+                import struct
+                t_val = 0.0
+                if len(frame["data"]) >= 9:
+                    try:
+                        t_val = struct.unpack("<d", frame["data"][1:9])[0]
+                    except Exception:
+                        pass
+                mav.send_tunnel(mc.make_pong(t_val))
+                print(f"[main] CMD_PING received -> PONG sent (t={t_val})")
+                return
             alt = 0.0
             if len(frame["data"]) >= 5:
                 import struct

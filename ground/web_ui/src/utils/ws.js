@@ -5,9 +5,15 @@ import { useEffect, useRef, useState, useCallback } from 'react'
 export function useRouterSocket(url = 'ws://127.0.0.1:8080') {
   const [connected, setConnected] = useState(false)
   const [position, setPosition] = useState(null)   // { lat, lon, alt, hdg }
-  const [heartbeat, setHeartbeat] = useState(null)  // { armed, mode }
+  const [heartbeat, setHeartbeat] = useState(null)  // { armed, mode, sys_id, comp_id }
   const [status, setStatus] = useState(null)        // { s, i, n, m }
   const [ack, setAck] = useState(null)              // { ok, count, crc }
+  const [gps, setGps] = useState(null)              // { fix_type, satellites, hdop }
+  const [sysStatus, setSysStatus] = useState(null)  // { voltage, current, battery_remaining }
+  const [attitude, setAttitude] = useState(null)    // { roll, pitch, yaw }
+  const [radio, setRadio] = useState(null)          // { rssi, remrssi, rxerrors, fixed, noise }
+  const [linkStats, setLinkStats] = useState(null)  // { rate_hz, total_packets, hb_age }
+  const [pong, setPong] = useState(null)            // { rtt_ms, t }
   const wsRef = useRef(null)
 
   useEffect(() => {
@@ -31,6 +37,12 @@ export function useRouterSocket(url = 'ws://127.0.0.1:8080') {
           case 'heartbeat': setHeartbeat(msg); break
           case 'status': setStatus(msg); break
           case 'ack': setAck(msg); break
+          case 'gps': setGps(msg); break
+          case 'sys_status': setSysStatus(msg); break
+          case 'attitude': setAttitude(msg); break
+          case 'radio': setRadio(msg); break
+          case 'link_stats': setLinkStats(msg); break
+          case 'pong': setPong(msg); break
           default: break
         }
       }
@@ -48,5 +60,23 @@ export function useRouterSocket(url = 'ws://127.0.0.1:8080') {
     return false
   }, [])
 
-  return { connected, position, heartbeat, status, ack, send }
+  const sendPing = useCallback(() => {
+    return send({ kind: 'ping' })
+  }, [send])
+
+  return {
+    connected,
+    position,
+    heartbeat,
+    status,
+    ack,
+    gps,
+    sysStatus,
+    attitude,
+    radio,
+    linkStats,
+    pong,
+    send,
+    sendPing
+  }
 }

@@ -162,11 +162,31 @@ class MockVehicle:
                     14  # satellites visible
                 ).pack(mav)
 
+                # 4. SYS_STATUS (Battery voltage & capacity)
+                sys_stat = mav.sys_status_encode(
+                    0, 0, 0, 500,     # sensors present, enabled, health, load
+                    15800,            # 15.80V (4S LiPo)
+                    45,               # 0.45A
+                    94,               # 94% battery remaining
+                    0, 0, 0, 0, 0, 0  # drop_rate_comm, errors_comm, errors_count 1..4
+                ).pack(mav)
+
+                # 5. ATTITUDE
+                att = mav.attitude_encode(
+                    int(time.time() * 1000) & 0xFFFFFFFF,
+                    0.005,         # roll rad (~0.3 deg)
+                    -0.008,        # pitch rad (~-0.5 deg)
+                    math.radians(self.hdg),
+                    0.0, 0.0, 0.0
+                ).pack(mav)
+
             for target in (self.ground_addr, self.autonomy_addr, self.mp_addr):
                 try:
                     self.sock.sendto(hb, target)
                     self.sock.sendto(pos, target)
                     self.sock.sendto(gps, target)
+                    self.sock.sendto(sys_stat, target)
+                    self.sock.sendto(att, target)
                 except Exception:
                     pass
 
